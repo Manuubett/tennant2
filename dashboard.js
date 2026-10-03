@@ -1703,11 +1703,81 @@ async function buildPropertyReportData(landlordId, monthStr, garbageFeeOverride)
   };
 }
 
+// docx's ImageRun wants raw bytes, not a base64 string — this is the
+// one conversion needed to hand it the BRAND logo assets (see
+// report-branding.js) regardless of which docx.js build is loaded.
+function base64ToUint8Array(base64) {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
 function buildPropertyReportDocument(data, recommendations) {
   const {
     Document, Packer, Paragraph, TextRun, Table, TableRow, TableCell,
-    WidthType, AlignmentType, BorderStyle, ShadingType, PageOrientation
+    WidthType, AlignmentType, BorderStyle, ShadingType, PageOrientation,
+    Header, Footer, ImageRun, HorizontalPositionAlign, HorizontalPositionRelativeFrom,
+    VerticalPositionAlign, VerticalPositionRelativeFrom, TextWrappingType
   } = docx;
+
+  // Letterhead: Sanefi logo + company info top-left on every page, the
+  // same info centered in the footer, and a large faded copy of the
+  // logo floating behind the page content as a watermark. BRAND comes
+  // from report-branding.js (loaded before this file in dashboard.html).
+  const headerLogoBytes = base64ToUint8Array(BRAND.headerLogoBase64);
+  const watermarkLogoBytes = base64ToUint8Array(BRAND.watermarkLogoBase64);
+
+  const reportHeader = new Header({
+    children: [
+      new Paragraph({
+        children: [
+          new ImageRun({
+            data: headerLogoBytes,
+            transformation: { width: BRAND.headerLogoWidth, height: BRAND.headerLogoHeight }
+          }),
+          // Anchored here so it repeats on every page; floating +
+          // behindDocument means it renders behind the body text rather
+          // than pushing the header layout around.
+          new ImageRun({
+            data: watermarkLogoBytes,
+            transformation: { width: BRAND.watermarkLogoWidth, height: BRAND.watermarkLogoHeight },
+            floating: {
+              horizontalPosition: { relative: HorizontalPositionRelativeFrom.PAGE, align: HorizontalPositionAlign.CENTER },
+              verticalPosition: { relative: VerticalPositionRelativeFrom.PAGE, align: VerticalPositionAlign.CENTER },
+              wrap: { type: TextWrappingType.NONE },
+              behindDocument: true
+            }
+          })
+        ]
+      }),
+      new Paragraph({
+        spacing: { before: 40 },
+        children: [new TextRun({ text: BRAND.companyName, bold: true, size: 18, color: "E6007E" })]
+      }),
+      new Paragraph({
+        children: [new TextRun({ text: BRAND.tagline, size: 14, color: "4B5C72" })]
+      })
+    ]
+  });
+
+  const reportFooter = new Footer({
+    children: [
+      new Paragraph({
+        alignment: AlignmentType.CENTER,
+        children: [new ImageRun({ data: headerLogoBytes, transformation: { width: 40, height: 32 } })]
+      }),
+      new Paragraph({
+        alignment: AlignmentType.CENTER,
+        spacing: { before: 20 },
+        children: [new TextRun({ text: `${BRAND.companyName}  |  ${BRAND.tagline}`, bold: true, size: 14, color: "10233F" })]
+      }),
+      new Paragraph({
+        alignment: AlignmentType.CENTER,
+        children: [new TextRun({ text: `${BRAND.website}   |   Tel: ${BRAND.phone}`, size: 13, color: "4B5C72" })]
+      })
+    ]
+  });
 
   const thinBorder = { style: BorderStyle.SINGLE, size: 2, color: "999999" };
   const borders = { top: thinBorder, bottom: thinBorder, left: thinBorder, right: thinBorder };
@@ -1803,6 +1873,8 @@ function buildPropertyReportDocument(data, recommendations) {
   return new Document({
     sections: [{
       properties: { page: { size: { width: 11906, height: 16838 }, orientation: PageOrientation.LANDSCAPE } },
+      headers: { default: reportHeader },
+      footers: { default: reportFooter },
       children: [
         new Paragraph({
           alignment: AlignmentType.CENTER,
