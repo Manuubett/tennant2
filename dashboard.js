@@ -1547,6 +1547,7 @@ function renderReportsTab() {
           <p class="alert alert-error" id="property-report-error" style="display:none;"></p>
         </form>`
     })}
+    ${statementItemsPanelHTML(propertyOptions, defaultMonth)}
     ${waterReadingsPanelHTML(propertyOptions, defaultMonth)}
     <div class="card">
       <div class="field"><label>Filter by Landlord</label><select id="report-landlord">${landlordOptions}</select></div>
@@ -1560,6 +1561,7 @@ function renderReportsTab() {
     <div id="report-output"></div>`;
 
   wireCollapsePanel("property-report-panel", { collapsedLabel: "+ Monthly Property Report (Excel / Word)", expandedLabel: "Monthly Property Report (Excel / Word)" });
+  wireStatementItemsPanel();
   wireWaterReadingsPanel();
 
   document.getElementById("btn-rent-roll").addEventListener("click", showRentRoll);
