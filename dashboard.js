@@ -1529,23 +1529,25 @@ function renderReportsTab() {
     ${collapsePanelHTML({
       id: "property-report-panel",
       title: "Monthly Property Report",
-      collapsedLabel: "+ Monthly Property Report (Word)",
-      expandedLabel: "Monthly Property Report (Word)",
+      collapsedLabel: "+ Monthly Property Report (Excel / Word)",
+      expandedLabel: "Monthly Property Report (Excel / Word)",
       bodyHTML: `
-        <div class="card-sub" style="margin-bottom:14px;">Generates the per-property monthly rent-roll statement — unit-by-unit rent, tenant, payment and arrears, plus a commission summary and deposit-refund table — as a downloadable Word document.</div>
+        <div class="card-sub" style="margin-bottom:14px;">Generates the per-property monthly rent-roll statement — unit-by-unit rent, tenant, payment, deposits, arrears and water usage, plus a commission summary and deposit-refund table — as a downloadable Excel or Word file. Excel is the same layout as the manual rent sheet; water readings are entered in the Water Readings panel below.</div>
         <form id="property-report-form">
-          <div class="field"><label>Property / Landlord</label><select name="landlordId"><option value="">All Properties (one .docx per property, zipped)</option>${propertyOptions}</select></div>
+          <div class="field"><label>Property / Landlord</label><select name="landlordId"><option value="">All Properties (one file per property, zipped)</option>${propertyOptions}</select></div>
           <div class="field"><label>Month</label><input type="month" name="month" value="${defaultMonth}" required></div>
+          <div class="field"><label>Format</label><select name="format"><option value="xlsx">Excel (.xlsx)</option><option value="docx">Word (.docx)</option></select></div>
           <div class="field">
             <label>Garbage Fee Override (KSh, optional)</label>
             <input type="number" name="garbageFee" min="0" placeholder="Leave blank to use each property's saved fee">
             <small>Each property's garbage fee is now saved on its Landlord record (edit it from the Landlords tab) and used automatically. Filling this in only overrides a single-property report for this one run — it's ignored when generating All Properties, since the whole point is that the fee varies per property.</small>
           </div>
           <div class="field"><label>Recommendations</label><textarea name="recommendations" placeholder="e.g. We recommend reducing of the prices and repainting of the premises"></textarea><small>When generating for All Properties, this same note is applied to every property.</small></div>
-          <button type="submit" class="btn btn-primary" id="property-report-submit">Generate Word Report</button>
+          <button type="submit" class="btn btn-primary" id="property-report-submit">Generate Report</button>
           <p class="alert alert-error" id="property-report-error" style="display:none;"></p>
         </form>`
     })}
+    ${waterReadingsPanelHTML(propertyOptions, defaultMonth)}
     <div class="card">
       <div class="field"><label>Filter by Landlord</label><select id="report-landlord">${landlordOptions}</select></div>
       <div style="display:flex; gap:8px; margin-top:10px; flex-wrap:wrap;">
@@ -1557,7 +1559,8 @@ function renderReportsTab() {
     </div>
     <div id="report-output"></div>`;
 
-  wireCollapsePanel("property-report-panel", { collapsedLabel: "+ Monthly Property Report (Word)", expandedLabel: "Monthly Property Report (Word)" });
+  wireCollapsePanel("property-report-panel", { collapsedLabel: "+ Monthly Property Report (Excel / Word)", expandedLabel: "Monthly Property Report (Excel / Word)" });
+  wireWaterReadingsPanel();
 
   document.getElementById("btn-rent-roll").addEventListener("click", showRentRoll);
   document.getElementById("btn-arrears").addEventListener("click", showArrears);
@@ -1573,31 +1576,40 @@ function renderReportsTab() {
     const data = new FormData(reportForm);
     const landlordId = data.get("landlordId");
     const month = data.get("month");
+    const format = data.get("format"); // "xlsx" or "docx"
     const garbageFeeOverride = data.get("garbageFee"); // "" if left blank — see buildPropertyReportData
     const recommendations = data.get("recommendations");
     reportSubmit.disabled = true;
     try {
       if (landlordId) {
         reportSubmit.textContent = "Generating...";
-        await generatePropertyReportDocx(landlordId, month, garbageFeeOverride, recommendations);
+        if (format === "xlsx") {
+          await generatePropertyReportXlsx(landlordId, month, garbageFeeOverride, recommendations);
+        } else {
+          await generatePropertyReportDocx(landlordId, month, garbageFeeOverride, recommendations);
+        }
       } else {
         // Bulk run: never pass the shared override through — each
         // property uses its own saved garbageFee automatically, since
         // the fee genuinely varies property to property.
-        await generateAllPropertyReportsZip(month, recommendations, (done, total) => {
+        const onProgress = (done, total) => {
           reportSubmit.textContent = `Generating ${done}/${total}...`;
-        });
+        };
+        if (format === "xlsx") {
+          await generateAllPropertyReportsXlsxZip(month, recommendations, onProgress);
+        } else {
+          await generateAllPropertyReportsZip(month, recommendations, onProgress);
+        }
       }
     } catch (err) {
       reportError.textContent = "Couldn't generate report: " + err.message;
       reportError.style.display = "block";
     } finally {
       reportSubmit.disabled = false;
-      reportSubmit.textContent = "Generate Word Report";
+      reportSubmit.textContent = "Generate Report";
     }
   });
 }
-
 // ---------------------------------------------------------------------
 // MONTHLY PROPERTY REPORT (Word/.docx)
 // ---------------------------------------------------------------------
@@ -1659,6 +1671,7 @@ async function buildPropertyReportData(landlordId, monthStr, garbageFeeOverride)
     const contact = t ? (t.contact || t.phone || t.phoneNumber || "—") : "—";
     const rentAmount = Number(u.rentAmount || 0);
     return {
+     unitId: doc.id,
       hseNo: i + 1,
       unitLabel: u.houseNumber || "",
       unitType: u.unitType || "",
