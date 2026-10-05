@@ -32,3 +32,8 @@ db.enablePersistence().catch((err) => {
     console.warn("Firestore persistence not supported in this browser.");
   }
 });
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("sw.js").catch(console.error);
+  });
+}
