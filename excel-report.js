@@ -30,6 +30,15 @@ const XL_FIRST_DATA_ROW = 7; // header on row 5, "RENT" sub-header on row 6 (sam
 const XL_MONEY_FMT = "#,##0";
 const XL_MONEY_BLANK_ZERO = '#,##0;-#,##0;;@'; // zero shows as empty, like the manual sheet
 
+// "19/9/26 4:21 PM/UIJLO7Z5IK" -> "19-09/UIJLO7Z5IK" (the manual sheet's style).
+// Anything that doesn't match the pattern is left exactly as it was.
+function xlFormatDateCode(text) {
+  return String(text || "").split("\n").map((line) => {
+    const m = line.match(/^(\d{1,2})\/(\d{1,2})\/\d{2,4}[^\/]*\/(.+)$/);
+    return m ? `${m[1].padStart(2, "0")}-${m[2].padStart(2, "0")}/${m[3]}` : line;
+  }).join("\n");
+}
+
 function xlPreviousMonthStr(monthStr) {
   const [y, m] = monthStr.split("-").map(Number);
   const d = new Date(y, m - 2, 1);
@@ -148,26 +157,35 @@ function buildPropertyWorkbook(ExcelJSLib, data, recommendations) {
   const last = first + data.rows.length - 1;
   const T = last + 1; // totals row
 
+  // Excel recalculates formulas when the file is opened, but phone previews and
+  // some viewers only show the saved result, so we store the result as well.
+  const sums = { C: 0, G: 0, H: 0, J: 0, K: 0, N: 0 };
+
   data.rows.forEach((r, i) => {
     const n = first + i;
     const vacant = r.name === "V";
+    const paid = typeof r.monthCell === "number" ? r.monthCell : 0;
+    const arrears = vacant ? null : Math.max((r.prevArr || 0) + r.rentAmount - paid, 0);
+    const used = typeof r.prevReading === "number" && typeof r.curReading === "number" ? r.curReading - r.prevReading : "";
+    sums.C += r.rentAmount; sums.G += r.prevArr || 0; sums.H += paid; sums.J += r.deposit || 0;
+    sums.K += arrears || 0; sums.N += used === "" ? 0 : used;
     put(ws.getCell(n, 1), r.unitLabel);
     put(ws.getCell(n, 2), r.unitType);
     put(ws.getCell(n, 3), r.rentAmount, { numFmt: XL_MONEY_FMT });
     put(ws.getCell(n, 4), r.waterMeter ? String(r.waterMeter) : null);
-    put(ws.getCell(n, 5), r.name, { wrap: true });
+    put(ws.getCell(n, 5), vacant ? "V" : String(r.name).toUpperCase(), { wrap: true });
     put(ws.getCell(n, 6), r.contact, { wrap: true });
     put(ws.getCell(n, 7), r.prevArr || null, { numFmt: XL_MONEY_BLANK_ZERO });
     put(ws.getCell(n, 8), r.monthCell, { numFmt: XL_MONEY_FMT, align: typeof r.monthCell === "number" ? undefined : "center" });
-    put(ws.getCell(n, 9), vacant ? null : r.dateCode, { wrap: true });
+    put(ws.getCell(n, 9), vacant ? null : xlFormatDateCode(r.dateCode), { wrap: true });
     put(ws.getCell(n, 10), r.deposit, { numFmt: XL_MONEY_BLANK_ZERO });
     // ARREARS = what was owed before + this month's rent - what was paid.
     // N() turns the text "NP"/"V" into 0 so the formula never errors.
-    put(ws.getCell(n, 11), vacant ? null : { formula: `MAX(G${n}+C${n}-N(H${n}),0)` },
+    put(ws.getCell(n, 11), vacant ? null : { formula: `MAX(G${n}+C${n}-N(H${n}),0)`, result: arrears },
       { numFmt: XL_MONEY_BLANK_ZERO, color: { argb: "FFB42323" }, bold: true });
     put(ws.getCell(n, 12), r.prevReading);
     put(ws.getCell(n, 13), r.curReading);
-    put(ws.getCell(n, 14), { formula: `IF(AND(ISNUMBER(L${n}),ISNUMBER(M${n})),M${n}-L${n},"")` });
+    put(ws.getCell(n, 14), { formula: `IF(AND(ISNUMBER(L${n}),ISNUMBER(M${n})),M${n}-L${n},"")`, result: used });
   });
 
   // Totals row (real formulas)
@@ -175,7 +193,7 @@ function buildPropertyWorkbook(ExcelJSLib, data, recommendations) {
   ws.getCell(T, 1).value = "TOTAL";
   [[3, "C"], [7, "G"], [8, "H"], [10, "J"], [11, "K"], [14, "N"]].forEach(([c, L]) => {
     const cell = ws.getCell(T, c);
-    cell.value = { formula: `SUM(${L}${first}:${L}${last})` };
+    cell.value = { formula: `SUM(${L}${first}:${L}${last})`, result: sums[L] };
     cell.numFmt = XL_MONEY_FMT;
   });
 
@@ -191,14 +209,15 @@ function buildPropertyWorkbook(ExcelJSLib, data, recommendations) {
     row[key] = s;
     s++;
   }
-  summary("collected", "TOTAL RENT COLLECTED", { formula: `H${T}` });
+  const commissionAmt = Math.round(sums.H * data.commissionRate);
+  summary("collected", "TOTAL RENT COLLECTED", { formula: `H${T}`, result: sums.H });
   summary("garbage", "GARBAGE", data.garbageFee, { input: true });
-  summary("deposits", "TOTAL DEPOSIT COLLECTED", { formula: `J${T}` });
-  summary("commissionable", "AMOUNT COMMISSIONABLE", { formula: `H${T}` });
+  summary("deposits", "TOTAL DEPOSIT COLLECTED", { formula: `J${T}`, result: sums.J });
+  summary("commissionable", "AMOUNT COMMISSIONABLE", { formula: `H${T}`, result: sums.H });
   summary("rate", "COMMISSION RATE", data.commissionRate, { numFmt: "0.0%", input: true });
-  summary("commission", "SANEFI COMMISSION", { formula: `ROUND(D${row.commissionable}*D${row.rate},0)` });
+  summary("commission", "SANEFI COMMISSION", { formula: `ROUND(D${row.commissionable}*D${row.rate},0)`, result: commissionAmt });
   summary("cleaning", "CLEANING", data.cleaningFee, { input: true });
-  summary("due", "AMOUNT DUE TO AGENT", { formula: `D${row.commission}+D${row.cleaning}` }, { bold: true });
+  summary("due", "AMOUNT DUE TO AGENT", { formula: `D${row.commission}+D${row.cleaning}`, result: commissionAmt + data.cleaningFee }, { bold: true });
 
   // Key + notes
   s++;
@@ -236,7 +255,7 @@ function buildPropertyWorkbook(ExcelJSLib, data, recommendations) {
       put(ws2.getCell(n, 2), d.unitLabel);
       put(ws2.getCell(n, 3), d.totalDeposit, { numFmt: XL_MONEY_FMT });
       put(ws2.getCell(n, 4), d.deductions, { numFmt: XL_MONEY_FMT });
-      put(ws2.getCell(n, 5), { formula: `C${n}-D${n}` }, { numFmt: XL_MONEY_FMT });
+      put(ws2.getCell(n, 5), { formula: `C${n}-D${n}`, result: d.totalDeposit - d.deductions }, { numFmt: XL_MONEY_FMT });
     });
   }
   const rr = 2 + Math.max(data.depositsRefunded.length, 1) + 1;
@@ -391,5 +410,5 @@ function wireWaterReadingsPanel() {
 
 // Lets the same file be unit-tested in Node (no browser needed).
 if (typeof module !== "undefined" && module.exports) {
-  module.exports = { buildPropertyWorkbook, xlPreviousMonthStr };
+  module.exports = { buildPropertyWorkbook, xlPreviousMonthStr, xlFormatDateCode };
 }
