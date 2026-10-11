@@ -499,6 +499,8 @@ function renderPaymentsTab() {
       const p = doc.data();
       const mismatchBadge = p.recipientMatch === false
         ? `<span class="pill pill-mismatch">Mismatch</span>` : "";
+      const reviewBadge = p.needsReview
+        ? `<span class="pill pill-pending" title="${escapeHTML((p.warnings || []).join(" "))}">Check</span>` : "";
       const manualBadge = p.enteredByStaff
         ? `<span class="pill pill-neutral">Staff Entry</span>` : "";
       const actions = p.status === "pending"
@@ -512,7 +514,7 @@ function renderPaymentsTab() {
           <td data-label="Unit">${escapeHTML(unitLabel(p.unitId))}</td>
           <td data-label="Landlord">${escapeHTML(landlordName(p.landlordId))}</td>
           <td data-label="Reference">${escapeHTML(p.transactionCode || "Manual entry")}<div class="cell-muted" style="font-size:11.5px; margin-top:2px;">${escapeHTML(p.paidAtRaw || "")}</div></td>
-          <td data-label="Status"><span class="pill pill-${p.status}">${p.status}</span> ${mismatchBadge}${manualBadge}</td>
+          <td data-label="Status"><span class="pill pill-${p.status}">${p.status}</span> ${mismatchBadge}${reviewBadge}${manualBadge}</td>
           <td data-label="" class="table-actions">${actions}</td>
         </tr>`;
     }
@@ -609,15 +611,26 @@ function renderPaymentsTab() {
       const unitDoc = unitsCache.find((d) => d.id === unitId);
       const landlordId = unitDoc ? unitDoc.data().landlordId : null;
 
-      const parsed = parseMpesaMessage(rawMessage);
+      const parsed = parsePayment(rawMessage);
       if (!parsed.success) {
         manualError.textContent = parsed.error;
         manualError.style.display = "block";
+        // Keep messages we couldn't read so a new format can be added to
+        // the parser later. Best effort only: never block the user on this.
+        if (parsed.unparsed && String(rawMessage || "").trim()) {
+          db.collection("unparsedMessages").add({
+            rawMessage: String(rawMessage).trim(),
+            unitId: unitId || null,
+            landlordId: landlordId || null,
+            source: "staff_entry",
+            createdAt: firebase.firestore.FieldValue.serverTimestamp()
+          }).catch(() => {});
+        }
         return;
       }
 
       try {
-        const dupe = await db.collection("payments").where("transactionCode", "==", parsed.transactionCode).get();
+        const dupe = await db.collection("payments").where("transactionCode", "==", parsed.mpesaRef).get();
         if (!dupe.empty) {
           manualError.textContent = "This payment has already been recorded.";
           manualError.style.display = "block";
@@ -633,10 +646,21 @@ function renderPaymentsTab() {
           landlordId,
           rawMessage: parsed.rawMessage,
           method: parsed.method,
-          transactionCode: parsed.transactionCode,
+          // transactionCode keeps holding the M-Pesa ref so existing
+          // reports, search and duplicate checks keep working.
+          transactionCode: parsed.mpesaRef,
           amount: parsed.amount,
-          paidAtRaw: parsed.paidAtRaw,
+          paidAtRaw: parsed.paidAtRaw || null,
+          paidAt: parsed.paidAt ? firebase.firestore.Timestamp.fromDate(new Date(parsed.paidAt)) : null,
+          dateInferred: !!parsed.dateInferred,
+          provider: parsed.provider || null,
+          perspective: parsed.perspective || null,
+          payerName: parsed.payerName || null,
+          accountRef: parsed.accountRef || null,
           recipientName: parsed.recipientName || null,
+          recipientPhone: parsed.recipientPhone || null,
+          needsReview: !!parsed.needsReview,
+          warnings: parsed.warnings || [],
           recipientMatch,
           enteredByStaff: true,
           status: "verified",
@@ -1064,6 +1088,7 @@ let editingLandlordId = null;
 function landlordMethodDetail(l) {
   return l.paymentMethod === "paybill" ? `Paybill ${l.paybillNumber || ""} (Acc: ${l.accountHint || "any"})`
     : l.paymentMethod === "till" ? `Till ${l.tillNumber || ""} (${l.businessName || ""})`
+    : l.paymentMethod === "bank" ? `Bank ${l.bankName || ""} ${l.bankAccountNumber || ""} (${l.bankAccountName || ""})`
     : `Phone ${l.phoneNumber || ""} (${l.registeredName || ""})`;
 }
 
@@ -1089,6 +1114,7 @@ function renderLandlordsTab() {
               <option value="paybill">Paybill</option>
               <option value="till">Till Number</option>
               <option value="phone">Send Money (Phone)</option>
+              <option value="bank">Bank Account (Equity, Co-op, etc.)</option>
             </select>
           </div>
           <div id="ll-paybill-fields">
@@ -1102,6 +1128,11 @@ function renderLandlordsTab() {
           <div id="ll-phone-fields" style="display:none;">
             <div class="field"><label>Phone Number</label><input type="text" name="phoneNumber"></div>
             <div class="field"><label>Registered M-Pesa Name</label><input type="text" name="registeredName"></div>
+          </div>
+          <div id="ll-bank-fields" style="display:none;">
+            <div class="field"><label>Bank Name (e.g. Equity, Co-operative)</label><input type="text" name="bankName"></div>
+            <div class="field"><label>Account Name (exactly as the bank shows it)</label><input type="text" name="bankAccountName"></div>
+            <div class="field"><label>Account Number (optional)</label><input type="text" name="bankAccountNumber"></div>
           </div>
           <div class="field"><label>Garbage Fee (KSh per month)</label><input type="number" name="garbageFee" min="0" value="0"><small>Used automatically in this property's monthly Word report. Varies per property, so it's saved here rather than typed in each time.</small></div>
           <div style="display:flex; gap:10px;">
@@ -1203,6 +1234,7 @@ function renderLandlordsTab() {
     document.getElementById("ll-paybill-fields").style.display = methodSelect.value === "paybill" ? "block" : "none";
     document.getElementById("ll-till-fields").style.display = methodSelect.value === "till" ? "block" : "none";
     document.getElementById("ll-phone-fields").style.display = methodSelect.value === "phone" ? "block" : "none";
+    document.getElementById("ll-bank-fields").style.display = methodSelect.value === "bank" ? "block" : "none";
   }
   methodSelect.addEventListener("change", toggleMethodFields);
 
@@ -1220,6 +1252,9 @@ function renderLandlordsTab() {
     form.businessName.value = l.businessName || "";
     form.phoneNumber.value = l.phoneNumber || "";
     form.registeredName.value = l.registeredName || "";
+    form.bankName.value = l.bankName || "";
+    form.bankAccountName.value = l.bankAccountName || "";
+    form.bankAccountNumber.value = l.bankAccountNumber || "";
     form.garbageFee.value = l.garbageFee || 0;
     toggleMethodFields();
     if (panelTitle) panelTitle.textContent = `Edit ${l.name}`;
@@ -1252,6 +1287,9 @@ function renderLandlordsTab() {
       businessName: data.get("businessName") || null,
       phoneNumber: data.get("phoneNumber") || null,
       registeredName: data.get("registeredName") || null,
+      bankName: data.get("bankName") || null,
+      bankAccountName: data.get("bankAccountName") || null,
+      bankAccountNumber: data.get("bankAccountNumber") || null,
       garbageFee: Number(data.get("garbageFee")) || 0
     };
     try {
