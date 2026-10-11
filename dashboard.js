@@ -931,9 +931,24 @@ async function renderTenantProfile(tenantId) {
         <p class="alert alert-success" id="deposit-inline-success" style="display:none;">Saved.</p>
       </form>`;
 
+  // Payment history now includes Verify / Reject buttons on pending
+  // payments, mirroring the actions in the main Payments tab.
   const paymentsHTML = paymentsSnap.empty ? `<p class="empty-state">No payments yet.</p>` : paymentsSnap.docs.map((doc) => {
     const p = doc.data();
-    return `<div class="payment-row"><div><div class="amount">${money(p.amount)}</div><div class="meta">${p.paidAtRaw || ""}</div></div><span class="pill pill-${p.status}">${p.status}</span></div>`;
+    const actions = p.status === "pending" ? `
+      <button class="btn-table-action" data-pay-action="verify" data-pay-id="${doc.id}">Verify</button>
+      <button class="btn-table-action btn-table-action-danger" data-pay-action="reject" data-pay-id="${doc.id}">Reject</button>` : "";
+    return `
+      <div class="payment-row">
+        <div>
+          <div class="amount">${money(p.amount)}</div>
+          <div class="meta">${escapeHTML(p.transactionCode || "")} ${escapeHTML(p.paidAtRaw || "")}</div>
+        </div>
+        <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap; justify-content:flex-end;">
+          <span class="pill pill-${p.status}">${p.status}</span>
+          ${actions}
+        </div>
+      </div>`;
   }).join("");
 
   const maintenanceHTML = maintenanceSnap.empty ? `<p class="empty-state">No maintenance requests.</p>` : maintenanceSnap.docs.map((doc) => {
@@ -1043,6 +1058,32 @@ async function renderTenantProfile(tenantId) {
       }
     });
   }
+
+  // Verify / Reject handlers for pending payments in the tenant's
+  // Payment History.
+  contentBox.querySelectorAll("[data-pay-action]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const id = btn.dataset.payId;
+      const isVerify = btn.dataset.payAction === "verify";
+      const status = isVerify ? "verified" : "rejected";
+      const paymentDoc = paymentsSnap.docs.find((d) => d.id === id);
+
+      const amt = paymentDoc ? money(paymentDoc.data().amount) : "this payment";
+      if (!confirm(`${isVerify ? "Verify" : "Reject"} ${amt}?`)) return;
+
+      btn.disabled = true;
+      try {
+        await db.collection("payments").doc(id).update({ status });
+        if (isVerify) {
+          addNotification(tenantId, "payment_verified", `Your payment of ${amt} has been verified.`, { paymentId: id });
+        }
+        renderTenantProfile(tenantId);
+      } catch (err) {
+        alert("Couldn't update: " + err.message);
+        btn.disabled = false;
+      }
+    });
+  });
 
   contentBox.querySelectorAll("[data-mtn-action]").forEach((btn) => {
     btn.addEventListener("click", async () => {
@@ -1711,7 +1752,7 @@ async function buildPropertyReportData(landlordId, monthStr, garbageFeeOverride)
     const contact = t ? (t.contact || t.phone || t.phoneNumber || "—") : "—";
     const rentAmount = Number(u.rentAmount || 0);
     return {
-     unitId: doc.id,
+      unitId: doc.id,
       hseNo: i + 1,
       unitLabel: u.houseNumber || "",
       unitType: u.unitType || "",
