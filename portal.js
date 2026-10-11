@@ -282,11 +282,23 @@ paymentForm.addEventListener("submit", async (e) => {
   successBox.style.display = "none";
 
   const rawMessage = new FormData(paymentForm).get("message");
-  const parsed = parseMpesaMessage(rawMessage);
+  const parsed = parsePayment(rawMessage);
 
   if (!parsed.success) {
     errorBox.textContent = parsed.error;
     errorBox.style.display = "block";
+    // Keep messages we couldn't read so a new format can be added to the
+    // parser later. Best effort only: never block the tenant on this.
+    if (parsed.unparsed && String(rawMessage || "").trim() && auth.currentUser) {
+      db.collection("unparsedMessages").add({
+        rawMessage: String(rawMessage).trim(),
+        tenantId: auth.currentUser.uid,
+        unitId: tenantProfile ? tenantProfile.unitId || null : null,
+        landlordId: tenantProfile ? tenantProfile.landlordId || null : null,
+        source: "tenant_submit",
+        createdAt: firebase.firestore.FieldValue.serverTimestamp()
+      }).catch(() => {});
+    }
     return;
   }
 
@@ -294,7 +306,7 @@ paymentForm.addEventListener("submit", async (e) => {
   submitBtn.textContent = "Submitting...";
 
   try {
-    const dupe = await db.collection("payments").where("transactionCode", "==", parsed.transactionCode).get();
+    const dupe = await db.collection("payments").where("transactionCode", "==", parsed.mpesaRef).get();
     if (!dupe.empty) {
       errorBox.textContent = "This payment has already been submitted.";
       errorBox.style.display = "block";
@@ -303,7 +315,12 @@ paymentForm.addEventListener("submit", async (e) => {
       return;
     }
 
-    const recipientMatch = landlordProfile ? checkRecipientMatch(parsed, landlordProfile) : false;
+    // "You have received..." messages are what the landlord's account
+    // gets, not what a tenant is sent after paying. A tenant has no
+    // legitimate reason to paste one, so it is never treated as a match.
+    const recipientMatch = (landlordProfile && parsed.perspective !== "receiver")
+      ? checkRecipientMatch(parsed, landlordProfile)
+      : false;
 
     // Bug fix / feature: the new payment doc's own id wasn't captured
     // before, so the "payment_submitted" notification had no way to
@@ -315,10 +332,21 @@ paymentForm.addEventListener("submit", async (e) => {
       landlordId: tenantProfile.landlordId,
       rawMessage: parsed.rawMessage,
       method: parsed.method,
-      transactionCode: parsed.transactionCode,
+      // transactionCode keeps holding the M-Pesa ref so existing
+      // reports, search and duplicate checks keep working.
+      transactionCode: parsed.mpesaRef,
       amount: parsed.amount,
-      paidAtRaw: parsed.paidAtRaw,
+      paidAtRaw: parsed.paidAtRaw || null,
+      paidAt: parsed.paidAt ? firebase.firestore.Timestamp.fromDate(new Date(parsed.paidAt)) : null,
+      dateInferred: !!parsed.dateInferred,
+      provider: parsed.provider || null,
+      perspective: parsed.perspective || null,
+      payerName: parsed.payerName || null,
+      accountRef: parsed.accountRef || null,
       recipientName: parsed.recipientName || null,
+      recipientPhone: parsed.recipientPhone || null,
+      needsReview: !!parsed.needsReview || parsed.perspective === "receiver",
+      warnings: parsed.warnings || [],
       recipientMatch,
       status: "pending",
       submittedAt: firebase.firestore.FieldValue.serverTimestamp()
