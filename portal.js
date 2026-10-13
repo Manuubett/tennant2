@@ -253,12 +253,21 @@ function loadHistory(uid) {
         const receiptBtn = p.status === "verified"
           ? `<button class="btn-link" data-receipt-id="${doc.id}" style="margin-top:6px;">Download Receipt</button>`
           : "";
+        // Rejected payments show the office's reason. Payments rejected
+        // before reasons existed have none, so fall back to a nudge to ask.
+        const rejectionHTML = p.status === "rejected"
+          ? `<div style="margin-top:8px; padding:8px 10px; border-left:3px solid #b42323; background:rgba(180,35,35,.08); border-radius:6px; font-size:13px; line-height:1.4;">
+               <strong style="color:#b42323;">Why it was rejected</strong><br>
+               ${escapeHTML(p.rejectionReason || "The office didn't leave a reason. Please contact them for details.")}
+             </div>`
+          : "";
         return `
           <div class="payment-row">
             <div>
               <div class="amount">KSh ${Number(p.amount || 0).toLocaleString()}</div>
               <div class="meta">${p.paidAtRaw || ""} &middot; ${p.transactionCode || ""}</div>
               ${receiptBtn}
+              ${rejectionHTML}
             </div>
             ${pillFor(p.status)}
           </div>`;
@@ -306,8 +315,12 @@ paymentForm.addEventListener("submit", async (e) => {
   submitBtn.textContent = "Submitting...";
 
   try {
-    const dupe = await db.collection("payments").where("transactionCode", "==", parsed.mpesaRef).get();
-    if (!dupe.empty) {
+    // Tenants can't search every payment (that would expose other
+    // tenants' data), so duplicates are caught with a small paymentCodes
+    // marker per M-Pesa code instead.
+    const codeRef = db.collection("paymentCodes").doc(String(parsed.mpesaRef).replace(/\//g, "_"));
+    const dupe = await codeRef.get();
+    if (dupe.exists) {
       errorBox.textContent = "This payment has already been submitted.";
       errorBox.style.display = "block";
       submitBtn.disabled = false;
@@ -326,7 +339,15 @@ paymentForm.addEventListener("submit", async (e) => {
     // before, so the "payment_submitted" notification had no way to
     // reference which payment it was about. Capturing the ref here lets
     // reply.js (click-to-navigate) send staff straight to this tenant.
-    const paymentRef = await db.collection("payments").add({
+    const paymentRef = db.collection("payments").doc();
+    const submitBatch = db.batch();
+    // Creating the marker and the payment together means a failed
+    // submission never leaves a code "used" without a payment behind it.
+    submitBatch.set(codeRef, {
+      tenantId: auth.currentUser.uid,
+      createdAt: firebase.firestore.FieldValue.serverTimestamp()
+    });
+    submitBatch.set(paymentRef, {
       tenantId: auth.currentUser.uid,
       unitId: tenantProfile.unitId,
       landlordId: tenantProfile.landlordId,
@@ -351,6 +372,7 @@ paymentForm.addEventListener("submit", async (e) => {
       status: "pending",
       submittedAt: firebase.firestore.FieldValue.serverTimestamp()
     });
+    await submitBatch.commit();
 
     addNotification("staff", "payment_submitted", `${tenantProfile.name} submitted a payment of KSh ${Number(parsed.amount || 0).toLocaleString()}.`, { tenantId: auth.currentUser.uid, paymentId: paymentRef.id });
 
