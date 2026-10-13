@@ -492,7 +492,7 @@ function generateOverviewPDF(data) {
 // PAYMENTS TAB (table view + Record Payment modal)
 // ---------------------------------------------------------------------
 function renderPaymentsTab() {
-  const unsubscribe = db.collection("payments").orderBy("submittedAt", "desc").limit(100).onSnapshot((snapshot) => {
+  const unsubscribe = db.collection("payments").orderBy("submittedAt", "desc").limit(PAYMENTS_LOAD_LIMIT).onSnapshot((snapshot) => {
     if (activeTab !== "payments") return;
 
     function paymentRowHTML(doc) {
@@ -514,12 +514,12 @@ function renderPaymentsTab() {
           <td data-label="Unit">${escapeHTML(unitLabel(p.unitId))}</td>
           <td data-label="Landlord">${escapeHTML(landlordName(p.landlordId))}</td>
           <td data-label="Reference">${escapeHTML(p.transactionCode || "Manual entry")}<div class="cell-muted" style="font-size:11.5px; margin-top:2px;">${escapeHTML(p.paidAtRaw || "")}</div></td>
-          <td data-label="Status"><span class="pill pill-${p.status}">${p.status}</span> ${mismatchBadge}${reviewBadge}${manualBadge}</td>
+          <td data-label="Status"><span class="pill pill-${p.status}">${p.status}</span> ${mismatchBadge}${reviewBadge}${manualBadge}${rejectionReasonLineHTML(p)}</td>
           <td data-label="" class="table-actions">${actions}</td>
         </tr>`;
     }
 
-    const rowsHTML = snapshot.docs.map(paymentRowHTML).join("");
+    const rowsHTML = groupedPaymentRowsHTML(filterPaymentDocs(snapshot.docs), paymentRowHTML);
     const unitOptions = unitsCache.map((doc) => `<option value="${doc.id}" data-landlord="${doc.data().landlordId}">${escapeHTML(doc.data().houseNumber)} — ${escapeHTML(landlordName(doc.data().landlordId))}</option>`).join("");
 
     contentBox.innerHTML = `
@@ -543,6 +543,7 @@ function renderPaymentsTab() {
           <input type="text" id="payment-search" placeholder="Search by unit, landlord or reference&hellip;">
         </div>
       </div>
+      ${paymentFilterBarHTML(snapshot.docs)}
       <div class="table-wrap">
         <table class="data-table">
           <thead>
@@ -559,23 +560,14 @@ function renderPaymentsTab() {
     const emptyState = document.getElementById("payments-empty");
 
     function paintRows(docs) {
-      tbody.innerHTML = docs.map(paymentRowHTML).join("");
+      tbody.innerHTML = groupedPaymentRowsHTML(docs, paymentRowHTML);
       emptyState.style.display = docs.length === 0 ? "block" : "none";
-      emptyState.textContent = snapshot.empty ? "No payments submitted yet." : "No payments match your search.";
+      emptyState.textContent = snapshot.empty ? "No payments submitted yet." : "No payments match your filters.";
       wireRowActions();
     }
 
-    document.getElementById("payment-search").addEventListener("input", (e) => {
-      const q = e.target.value.trim().toLowerCase();
-      if (!q) { paintRows(snapshot.docs); return; }
-      const filteredDocs = snapshot.docs.filter((doc) => {
-        const p = doc.data();
-        return (unitLabel(p.unitId) || "").toLowerCase().includes(q)
-          || (landlordName(p.landlordId) || "").toLowerCase().includes(q)
-          || (p.transactionCode || "").toLowerCase().includes(q);
-      });
-      paintRows(filteredDocs);
-    });
+    // Search box + filter bar (status, date, landlord, flags) live in payments-grouping.js
+    initPaymentFilters(snapshot.docs, paintRows);
 
     function wireRowActions() {
       contentBox.querySelectorAll("[data-action]").forEach((btn) => {
@@ -583,6 +575,11 @@ function renderPaymentsTab() {
           const id = btn.dataset.id;
           const status = btn.dataset.action === "verify" ? "verified" : "rejected";
           const paymentDoc = snapshot.docs.find((d) => d.id === id);
+          if (status === "rejected") {
+            // Reason dialog + save + tenant notification live in payment-rejection.js
+            await rejectPaymentWithReason(id, paymentDoc, btn);
+            return;
+          }
           btn.disabled = true;
           try {
             await db.collection("payments").doc(id).update({ status });
@@ -640,7 +637,15 @@ function renderPaymentsTab() {
         const landlordDoc = landlordsCache.find((d) => d.id === landlordId);
         const recipientMatch = landlordDoc ? checkRecipientMatch(parsed, landlordDoc.data()) : false;
 
-        await db.collection("payments").add({
+        // Also leave a paymentCodes marker so a tenant can't resubmit the
+        // same M-Pesa code later (tenants check paymentCodes, not payments).
+        const manualBatch = db.batch();
+        manualBatch.set(db.collection("paymentCodes").doc(String(parsed.mpesaRef).replace(/\//g, "_")), {
+          tenantId: null,
+          source: "staff_entry",
+          createdAt: firebase.firestore.FieldValue.serverTimestamp()
+        });
+        manualBatch.set(db.collection("payments").doc(), {
           tenantId: null,
           unitId,
           landlordId,
@@ -666,6 +671,7 @@ function renderPaymentsTab() {
           status: "verified",
           submittedAt: firebase.firestore.FieldValue.serverTimestamp()
         });
+        await manualBatch.commit();
         manualForm.reset();
         document.getElementById("record-payment-panel")._setOpen(false);
       } catch (err) {
@@ -943,6 +949,7 @@ async function renderTenantProfile(tenantId) {
         <div>
           <div class="amount">${money(p.amount)}</div>
           <div class="meta">${escapeHTML(p.transactionCode || "")} ${escapeHTML(p.paidAtRaw || "")}</div>
+          ${rejectionReasonLineHTML(p)}
         </div>
         <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap; justify-content:flex-end;">
           <span class="pill pill-${p.status}">${p.status}</span>
@@ -1067,6 +1074,13 @@ async function renderTenantProfile(tenantId) {
       const isVerify = btn.dataset.payAction === "verify";
       const status = isVerify ? "verified" : "rejected";
       const paymentDoc = paymentsSnap.docs.find((d) => d.id === id);
+
+      if (!isVerify) {
+        // Reason dialog + save + tenant notification live in payment-rejection.js
+        const rejected = await rejectPaymentWithReason(id, paymentDoc, btn);
+        if (rejected) renderTenantProfile(tenantId);
+        return;
+      }
 
       const amt = paymentDoc ? money(paymentDoc.data().amount) : "this payment";
       if (!confirm(`${isVerify ? "Verify" : "Reject"} ${amt}?`)) return;
