@@ -26,20 +26,17 @@ let searchIndex = []; // combined, deduplicated list of things a tenant might se
 //     — occupancy is still "vacant" at that point, so relying on
 //     occupancy alone would still let a second tenant claim the same
 //     unit during the pending window.
+//
+// Security rules change: this page runs before the tenant has an
+// account, so it can no longer read the tenants collection (that would
+// expose every tenant's name, phone and email). "claimed" now comes from
+// units.claimedBy, which signup sets on the unit when the account is made.
 Promise.all([
   db.collection("landlords").orderBy("name").get(),
-  db.collection("units").get(),
-  db.collection("tenants").get()
-]).then(([landlordSnap, unitSnap, tenantSnap]) => {
+  db.collection("units").get()
+]).then(([landlordSnap, unitSnap]) => {
   const landlordsById = {};
   landlordSnap.docs.forEach((doc) => { landlordsById[doc.id] = doc.data().name; });
-
-  const claimedUnitIds = new Set(
-    tenantSnap.docs
-      .map((doc) => doc.data())
-      .filter((t) => t.unitId)
-      .map((t) => t.unitId)
-  );
 
   allUnits = unitSnap.docs.map((doc) => {
     const u = doc.data();
@@ -50,7 +47,7 @@ Promise.all([
       landlordId: u.landlordId,
       landlordName: landlordsById[u.landlordId] || "Unknown",
       occupancy: u.occupancy || "vacant",
-      claimed: claimedUnitIds.has(doc.id)
+      claimed: !!u.claimedBy
     };
   });
 
@@ -212,7 +209,10 @@ form.addEventListener("submit", async (e) => {
 
     // Tenant profile starts "pending" — staff confirm they actually live
     // in the unit they selected before payments are trusted.
-    await db.collection("tenants").doc(cred.user.uid).set({
+    // The profile and the unit claim are written together: if someone else
+    // claimed the unit first, the whole write is refused.
+    const batch = db.batch();
+    batch.set(db.collection("tenants").doc(cred.user.uid), {
       name: data.get("name"),
       phone: data.get("phone"),
       email: data.get("email"),
@@ -221,6 +221,17 @@ form.addEventListener("submit", async (e) => {
       status: "pending",
       createdAt: firebase.firestore.FieldValue.serverTimestamp()
     });
+    if (unitId) {
+      batch.update(db.collection("units").doc(unitId), { claimedBy: cred.user.uid });
+    }
+    try {
+      await batch.commit();
+    } catch (claimErr) {
+      // Don't leave a login with no profile behind (it would block a retry
+      // with the same email).
+      await cred.user.delete().catch(() => {});
+      throw new Error("That unit was just taken by another tenant. Please refresh and pick a different one, or contact the office.");
+    }
 
     window.location.href = "portal.html";
   } catch (err) {
