@@ -53,7 +53,8 @@ const COLORS = {
   border: "#e4e9f0",
   surface: "#ffffff"
 };
-
+// Max number of payment docs the Payments tab loads in its live listener.
+const PAYMENTS_LOAD_LIMIT = 200;
 const money = (n) => `KSh ${Number(n || 0).toLocaleString()}`;
 
 // Hides and removes the full-screen splash (logo + spinner) shown while
